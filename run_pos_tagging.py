@@ -31,6 +31,7 @@ flags = tf.flags
 FLAGS = flags.FLAGS
 
 LOCAL_MODEL_DIR = "/tmp/model_dir"
+DUMMY_TAG = "DUMMY"
 
 ## Required parameters
 flags.DEFINE_string(
@@ -139,11 +140,10 @@ class PosProcessor():
 
     def __init__(self):
         self.language = "zh"
-        self.labels = set()
 
     def get_train_examples(self, data_dir):
         """See base class."""
-        lines = self._read_data_file(data_dir)
+        lines = self._read_data_file(data_dir + "POS.train")
         examples = []
         for (i, line) in enumerate(lines):
             guid = "train-%d" % (i)
@@ -151,8 +151,37 @@ class PosProcessor():
             text = tokenization.convert_to_unicode(line[0])
             tags = tokenization.convert_to_unicode(line[1])
             tags = tags.split(" ")
-            for tag in tags:
-                self.labels.add(tag)
+            examples.append(
+                InputExample(guid=guid, text=text, tags=tags))
+        return examples
+
+    def get_dev_examples(self, data_dir):
+        """See base class."""
+        lines = self._read_data_file(data_dir + "POS.dev")
+        examples = []
+        for (i, line) in enumerate(lines):
+            guid = "dev-%d" % (i)
+            line = line.split("/t")
+            text = tokenization.convert_to_unicode(line[0])
+            tags = tokenization.convert_to_unicode(line[1])
+            tags = tags.split(" ")
+            examples.append(
+                InputExample(guid=guid, text=text, tags=tags))
+        return examples
+
+    def get_test_examples(self, data_dir):
+        lines = self._read_data_file(data_dir + "POS.test")
+        examples = []
+        for (i, line) in enumerate(lines):
+            guid = "test-%d" % (i)
+            line = line.split("/t")
+            if len(line) == 2:
+                text = tokenization.convert_to_unicode(line[0])
+                tags = tokenization.convert_to_unicode(line[1])
+                tags = tags.split(" ")
+            else:
+                text = tokenization.convert_to_unicode(line[0].strip())
+                tags = [DUMMY_TAG for _ in range(len(line[0].split()))]
             examples.append(
                 InputExample(guid=guid, text=text, tags=tags))
         return examples
@@ -167,7 +196,7 @@ class PosProcessor():
             return lines
 
     def get_labels(self, data_dir):
-        lines = self._read_data_file(data_dir)
+        lines = self._read_data_file(data_dir + "POS.train")
         labels = set()
         for (i, line) in enumerate(lines):
             line = line.split("/t")
@@ -255,22 +284,6 @@ def convert_single_example(ex_index, example, tag_id_map, max_seq_length,
         sentence_len=sentence_len,
         is_real_example=True)
     return feature
-
-
-# def convert_examples_to_features(
-    #     examples, tag_id_map, max_seq_length, tokenizer, output_file):
-    # """Convert a set of 'InputExamples"""
-    #
-    # features = []
-    # for (ex_index, example) in enumerate(examples):
-    #     if ex_index % 10000 == 0:
-    #         tf.logging.info("Convert example %d of %d"
-    #                         % (ex_index, len(examples)))
-    #
-    #     feature = convert_single_example(ex_index, example, tag_id_map,
-    #                                     max_seq_length, tokenizer)
-    #     features.append(feature)
-    # return features
 
 
 def file_based_convert_examples_to_features(
@@ -592,10 +605,10 @@ def main(_):
 
     processor = PosProcessor
 
-    label_list = processor.get_labels()
+    label_list = processor.get_labels(FLAGS.data_dir)
 
-    tokenizer = tokenization.FullTokenizer(
-        vocab_file=FLAGS.vocab_file, do_lower_case=FLAGS.do_lower_case)
+    tokenizer = tokenization.BasicTokenizer(vocab_file=FLAGS.vocab_file,
+                                            do_lower_case=FLAGS.do_lower_case)
 
     train_examples = None
     num_train_steps = None
@@ -640,14 +653,6 @@ def main(_):
     if FLAGS.do_eval:
         eval_examples = processor.get_dev_examples(FLAGS.data_dir)
         num_actual_eval_examples = len(eval_examples)
-        if FLAGS.use_tpu:
-        # TPU requires a fixed batch size for all batches, therefore the number
-        # of examples must be a multiple of the batch size, or else examples
-        # will get dropped. So we pad with fake examples which are ignored
-        # later on. These do NOT count towards the metric (all tf.metrics
-        # support a per-instance weight, and these get a weight of 0.0).
-            while len(eval_examples) % FLAGS.eval_batch_size != 0:
-                eval_examples.append(PaddingInputExample())
 
         eval_file = os.path.join(FLAGS.output_dir, "eval.tf_record")
         file_based_convert_examples_to_features(
@@ -660,19 +665,13 @@ def main(_):
         tf.logging.info("  Batch size = %d", FLAGS.eval_batch_size)
 
         # This tells the estimator to run through the entire set.
-        eval_steps = None
-        # However, if running eval on the TPU, you will need to specify the
-        # number of steps.
-        if FLAGS.use_tpu:
-            assert len(eval_examples) % FLAGS.eval_batch_size == 0
         eval_steps = int(len(eval_examples) // FLAGS.eval_batch_size)
 
-        eval_drop_remainder = True if FLAGS.use_tpu else False
         eval_input_fn = file_based_input_fn_builder(
             input_file=eval_file,
             seq_length=FLAGS.max_seq_length,
             is_training=False,
-            drop_remainder=eval_drop_remainder)
+            drop_remainder=False)
 
         result = estimator.evaluate(input_fn=eval_input_fn, steps=eval_steps)
 
@@ -686,13 +685,6 @@ def main(_):
     if FLAGS.do_predict:
         predict_examples = processor.get_test_examples(FLAGS.data_dir)
         num_actual_predict_examples = len(predict_examples)
-        if FLAGS.use_tpu:
-        # TPU requires a fixed batch size for all batches, therefore the number
-        # of examples must be a multiple of the batch size, or else examples
-        # will get dropped. So we pad with fake examples which are ignored
-        # later on.
-            while len(predict_examples) % FLAGS.predict_batch_size != 0:
-                predict_examples.append(PaddingInputExample())
 
         predict_file = os.path.join(FLAGS.output_dir, "predict.tf_record")
         file_based_convert_examples_to_features(predict_examples, label_list,
@@ -705,12 +697,11 @@ def main(_):
                         len(predict_examples) - num_actual_predict_examples)
         tf.logging.info("  Batch size = %d", FLAGS.predict_batch_size)
 
-        predict_drop_remainder = True if FLAGS.use_tpu else False
         predict_input_fn = file_based_input_fn_builder(
             input_file=predict_file,
             seq_length=FLAGS.max_seq_length,
             is_training=False,
-            drop_remainder=predict_drop_remainder)
+            drop_remainder=False)
 
         result = estimator.predict(input_fn=predict_input_fn)
 
@@ -732,7 +723,6 @@ def main(_):
 
 if __name__ == "__main__":
     flags.mark_flag_as_required("data_dir")
-    flags.mark_flag_as_required("task_name")
     flags.mark_flag_as_required("vocab_file")
     flags.mark_flag_as_required("bert_config_file")
     flags.mark_flag_as_required("output_dir")
