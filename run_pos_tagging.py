@@ -20,6 +20,7 @@ from __future__ import print_function
 
 import collections
 import csv
+import json
 import os
 import modeling
 import optimization
@@ -138,16 +139,17 @@ class InputFeatures(object):
 class PosProcessor():
     """Processor for the POS tag set."""
 
-    def __init__(self):
+    def __init__(self, data_dir):
         self.language = "zh"
+        self.data_dir = data_dir
 
-    def get_train_examples(self, data_dir):
+    def get_train_examples(self):
         """See base class."""
-        lines = self._read_data_file(data_dir + "POS.train")
+        lines = self._read_data_file(self.data_dir + "POS_small.train")
         examples = []
         for (i, line) in enumerate(lines):
             guid = "train-%d" % (i)
-            line = line.split("/t")
+            line = line.split("\t")
             text = tokenization.convert_to_unicode(line[0])
             tags = tokenization.convert_to_unicode(line[1])
             tags = tags.split(" ")
@@ -155,9 +157,9 @@ class PosProcessor():
                 InputExample(guid=guid, text=text, tags=tags))
         return examples
 
-    def get_dev_examples(self, data_dir):
+    def get_dev_examples(self):
         """See base class."""
-        lines = self._read_data_file(data_dir + "POS.dev")
+        lines = self._read_data_file(self.data_dir + "POS_small.dev")
         examples = []
         for (i, line) in enumerate(lines):
             guid = "dev-%d" % (i)
@@ -169,8 +171,8 @@ class PosProcessor():
                 InputExample(guid=guid, text=text, tags=tags))
         return examples
 
-    def get_test_examples(self, data_dir):
-        lines = self._read_data_file(data_dir + "POS.test")
+    def get_test_examples(self):
+        lines = self._read_data_file(self.data_dir + "POS_small.test")
         examples = []
         for (i, line) in enumerate(lines):
             guid = "test-%d" % (i)
@@ -192,19 +194,17 @@ class PosProcessor():
         with tf.gfile.Open(input_file, "r") as f:
             lines = []
             for line in f:
-                lines.append(line)
+                lines.append(line.strip())
             return lines
 
-    def get_labels(self, data_dir):
-        lines = self._read_data_file(data_dir + "POS.train")
-        labels = set()
-        for (i, line) in enumerate(lines):
-            line = line.split("/t")
-            tags = tokenization.convert_to_unicode(line[1])
-            tags = tags.split(" ")
-            for tag in tags:
-                labels.add(tag)
-        return list(labels)
+    def get_labels(self):
+
+        with open(self.data_dir + "tags.json") as f_in:
+            tags = json.load(f_in)
+        tag_id_map = {tags[i]: i + 1 for i in range(len(tags))}
+        # Manually add "POS" into tag_id_map
+        tag_id_map["PAD"] = 0
+        return tag_id_map
 
 
 
@@ -212,9 +212,8 @@ def convert_single_example(ex_index, example, tag_id_map, max_seq_length,
                            tokenizer):
     """Converts a single `InputExample` into a single `InputFeatures`."""
 
-
+    tags = example.tags
     tokens = tokenizer.tokenize(example.text)
-    tags = tokenizer.tokenize(example.tags)
     # Account for [CLS] and [SEP] with "- 2"
     if len(tokens) > max_seq_length - 2:
         tokens = tokens[0: (max_seq_length - 2)]
@@ -242,6 +241,7 @@ def convert_single_example(ex_index, example, tag_id_map, max_seq_length,
     # used as the "sentence vector". Note that this only makes sense because
     # the entire model is fine-tuned.
     tokens = ["[CLS]"] + tokens + ["[SEP]"]
+    tags.append("PAD")
     segment_ids = [0] * len(tokens)
 
     input_ids = tokenizer.convert_tokens_to_ids(tokens)
@@ -260,7 +260,6 @@ def convert_single_example(ex_index, example, tag_id_map, max_seq_length,
     assert len(input_ids) == max_seq_length
     assert len(input_mask) == max_seq_length
     assert len(segment_ids) == max_seq_length
-    assert len(tags) == max_seq_length
 
     tags_id = []
     for tag in tags:
@@ -308,7 +307,7 @@ def file_based_convert_examples_to_features(
         features["input_ids"] = create_int_feature(feature.input_ids)
         features["input_mask"] = create_int_feature(feature.input_mask)
         features["segment_ids"] = create_int_feature(feature.segment_ids)
-        features["tag_ids"] = create_int_feature([feature.tag_ids])
+        features["tag_ids"] = create_int_feature(feature.tag_ids)
         features["sentence_len"] = create_int_feature([feature.sentence_len])
         features["is_real_example"] = create_int_feature(
             [int(feature.is_real_example)])
@@ -506,7 +505,13 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
 
 
 def get_tag_map_tensors(params):
-    return None
+    with open(params.data_dir + "tags.json") as f_in:
+        tags = json.load(f_in)
+    tag_to_id = {tags[i]: i for i in range(len(tags))}
+    tag_to_id["PAD"] = 0
+    id_to_tag = {v: k for k, v in tag_to_id}
+    num_tags = len(tags)
+    return tag_to_id, id_to_tag, num_tags
 
 
 # This function is not used by this file but is still used by the Colab and
@@ -527,7 +532,13 @@ def input_fn_builder(features, seq_length, is_training, drop_remainder):
 
     def input_fn(params):
         """The actual input function."""
-        batch_size = params["batch_size"]
+
+        # batch_size = params["batch_size"]
+        batch_size = None
+        if is_training:
+            batch_size = params.train_batch_size
+        else:
+            batch_size = params.eval_batch_size
 
         num_examples = len(features)
 
@@ -603,9 +614,9 @@ def main(_):
 
     tf.gfile.MakeDirs(FLAGS.output_dir)
 
-    processor = PosProcessor
-
-    label_list = processor.get_labels(FLAGS.data_dir)
+    processor = PosProcessor(FLAGS.data_dir)
+    label_id_map = processor.get_labels()
+    print("label list: ", label_id_map)
 
     tokenizer = tokenization.BasicTokenizer(vocab_file=FLAGS.vocab_file,
                                             do_lower_case=FLAGS.do_lower_case)
@@ -614,7 +625,7 @@ def main(_):
     num_train_steps = None
     num_warmup_steps = None
     if FLAGS.do_train:
-        train_examples = processor.get_train_examples(FLAGS.data_dir)
+        train_examples = processor.get_train_examples()
         num_train_steps = int(
             len(train_examples)
             / FLAGS.train_batch_size * FLAGS.num_train_epochs)
@@ -630,7 +641,7 @@ def main(_):
     # Original config
     config = tf.estimator.RunConfig(save_checkpoints_steps=1000)
 
-    estimator = tf.contrib.Estimator(
+    estimator = tf.estimator.Estimator(
         model_fn=model_fn,
         config=config,
         model_dir=LOCAL_MODEL_DIR)
@@ -638,7 +649,7 @@ def main(_):
     if FLAGS.do_train:
         train_file = os.path.join(FLAGS.output_dir, "train.tf_record")
         file_based_convert_examples_to_features(
-            train_examples, label_list, FLAGS.max_seq_length, tokenizer, train_file)
+            train_examples, label_id_map, FLAGS.max_seq_length, tokenizer, train_file)
         tf.logging.info("***** Running training *****")
         tf.logging.info("  Num examples = %d", len(train_examples))
         tf.logging.info("  Batch size = %d", FLAGS.train_batch_size)
@@ -651,12 +662,12 @@ def main(_):
         estimator.train(input_fn=train_input_fn, max_steps=num_train_steps)
 
     if FLAGS.do_eval:
-        eval_examples = processor.get_dev_examples(FLAGS.data_dir)
+        eval_examples = processor.get_dev_examples()
         num_actual_eval_examples = len(eval_examples)
 
         eval_file = os.path.join(FLAGS.output_dir, "eval.tf_record")
         file_based_convert_examples_to_features(
-            eval_examples, label_list, FLAGS.max_seq_length, tokenizer, eval_file)
+            eval_examples, label_id_map, FLAGS.max_seq_length, tokenizer, eval_file)
 
         tf.logging.info("***** Running evaluation *****")
         tf.logging.info("  Num examples = %d (%d actual, %d padding)",
@@ -683,11 +694,11 @@ def main(_):
                 writer.write("%s = %s\n" % (key, str(result[key])))
 
     if FLAGS.do_predict:
-        predict_examples = processor.get_test_examples(FLAGS.data_dir)
+        predict_examples = processor.get_test_examples()
         num_actual_predict_examples = len(predict_examples)
 
         predict_file = os.path.join(FLAGS.output_dir, "predict.tf_record")
-        file_based_convert_examples_to_features(predict_examples, label_list,
+        file_based_convert_examples_to_features(predict_examples, label_id_map,
                                                 FLAGS.max_seq_length, tokenizer,
                                                 predict_file)
 

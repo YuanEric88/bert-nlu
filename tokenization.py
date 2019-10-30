@@ -137,7 +137,10 @@ def convert_by_vocab(vocab, items):
   """Converts a sequence of [tokens|ids] using the vocab."""
   output = []
   for item in items:
-    output.append(vocab[item])
+    try:
+        output.append(vocab[item])
+    except KeyError:
+        output.append(vocab['[UNK]'])
   return output
 
 
@@ -214,7 +217,8 @@ class BasicTokenizer(object):
       if self.do_lower_case:
         token = token.lower()
         token = self._run_strip_accents(token)
-      split_tokens.extend(self._run_split_on_punc(token))
+      split_tokens.append(token)
+      # split_tokens.extend(self._run_split_on_punc(token))
 
     output_tokens = whitespace_tokenize(" ".join(split_tokens))
     return output_tokens

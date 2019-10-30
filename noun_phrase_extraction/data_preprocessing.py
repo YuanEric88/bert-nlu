@@ -12,7 +12,17 @@ def preprocessing(input_name, output_name):
                     try:
                         word, tag = pair.rsplit("/", 1)
                         sentence.append(word)
-                        tags.append(tag)
+                        # Thinking about one token with different pos tag
+                        if "|" in tag:
+                            tag_group = tag.split("|")
+                            if "NN" in tag_group:
+                                tags.append("NN")
+                            elif "NNS" in tag_group:
+                                tags.append("NNS")
+                            else:
+                                tags.append(tag_group[0])
+                        else:
+                            tags.append(tag)
                     except:
                         print(pair)
                         pass
