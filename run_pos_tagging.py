@@ -346,7 +346,15 @@ def file_based_input_fn_builder(input_file, seq_length, is_training,
 
     def input_fn(params):
         """The actual input function."""
-        batch_size = params["batch_size"]
+        batch_size = None
+        print(params)
+        if is_training:
+            # batch_size = params.train_batch_size
+            batch_size = 32
+        else:
+            # batch_size = params.eval_batch_size
+            batch_size = 8
+        # batch_size = params["batch_size"]
 
         # For training, we want a lot of parallel reading and shuffling.
         # For eval, we want no shuffling and parallel reading doesn't matter.
@@ -616,7 +624,6 @@ def main(_):
 
     processor = PosProcessor(FLAGS.data_dir)
     label_id_map = processor.get_labels()
-    print("label list: ", label_id_map)
 
     tokenizer = tokenization.BasicTokenizer(vocab_file=FLAGS.vocab_file,
                                             do_lower_case=FLAGS.do_lower_case)
