@@ -22,10 +22,13 @@ import collections
 import csv
 import json
 import os
+import tensorflow as tf
+import functools
+
 import modeling
 import optimization
 import tokenization
-import tensorflow as tf
+
 
 flags = tf.flags
 
@@ -126,14 +129,12 @@ class InputFeatures(object):
                 input_mask,
                 segment_ids,
                 tag_ids,
-                 sentence_len,
-                is_real_example=True):
+                 sentence_len):
         self.input_ids = input_ids
         self.input_mask = input_mask
         self.segment_ids = segment_ids
         self.tag_ids = tag_ids
         self.sentence_len = sentence_len
-        self.is_real_example = is_real_example
 
 
 class PosProcessor():
@@ -280,8 +281,7 @@ def convert_single_example(ex_index, example, tag_id_map, max_seq_length,
         input_mask=input_mask,
         segment_ids=segment_ids,
         tag_ids=tags_id,
-        sentence_len=sentence_len,
-        is_real_example=True)
+        sentence_len=sentence_len)
     return feature
 
 
@@ -309,8 +309,6 @@ def file_based_convert_examples_to_features(
         features["segment_ids"] = create_int_feature(feature.segment_ids)
         features["tag_ids"] = create_int_feature(feature.tag_ids)
         features["sentence_len"] = create_int_feature([feature.sentence_len])
-        features["is_real_example"] = create_int_feature(
-            [int(feature.is_real_example)])
 
         tf_example = tf.train.Example(features=tf.train.Features(feature=features))
         writer.write(tf_example.SerializeToString())
@@ -326,8 +324,7 @@ def file_based_input_fn_builder(input_file, seq_length, is_training,
         "input_mask": tf.FixedLenFeature([seq_length], tf.int64),
         "segment_ids": tf.FixedLenFeature([seq_length], tf.int64),
         "sentence_len": tf.FixedLenFeature([], tf.int64),
-        "tag_ids": tf.FixedLenFeature([seq_length], tf.int64),
-        "is_real_example": tf.FixedLenFeature([], tf.int64),
+        "tag_ids": tf.FixedLenFeature([seq_length - 1], tf.int64),
     }
 
     def _decode_record(record, name_to_features):
@@ -347,13 +344,10 @@ def file_based_input_fn_builder(input_file, seq_length, is_training,
     def input_fn(params):
         """The actual input function."""
         batch_size = None
-        print(params)
         if is_training:
-            # batch_size = params.train_batch_size
-            batch_size = 32
+            batch_size = params.train_batch_size
         else:
-            # batch_size = params.eval_batch_size
-            batch_size = 8
+            batch_size = params.eval_batch_size
         # batch_size = params["batch_size"]
 
         # For training, we want a lot of parallel reading and shuffling.
@@ -375,7 +369,7 @@ def file_based_input_fn_builder(input_file, seq_length, is_training,
 
 
 def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
-                 num_tags):
+                 num_tags, osentences_len):
     """Creates a classification model."""
     model = modeling.BertModel(
         config=bert_config,
@@ -391,32 +385,25 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
     # instead.
     # output_layer = model.get_pooled_output()
     output_layer = model.get_sequence_output()
-    _, sentence_len, _ = output_layer.shape.as_list()
-
-    # Ignore the [cls] token in the head of the sentence.
-    output_layer = output_layer[:, 1:, :]
-
-    hidden_size = output_layer.shape[-1].value
-
-    output_weights = tf.get_variable(
-        "output_weights", [num_tags, hidden_size],
-        initializer=tf.truncated_normal_initializer(stddev=0.02))
-
-    output_bias = tf.get_variable(
-        "output_bias", [num_tags], initializer=tf.zeros_initializer())
 
     with tf.variable_scope("loss"):
         if is_training:
             # I.e., 0.1 dropout
             output_layer = tf.nn.dropout(output_layer, keep_prob=0.9)
+
+        _, sentence_len, _ = output_layer.shape.as_list()
+
+        # Ignore the [cls] token in the head of the sentence.
+        output_layer = output_layer[:, 1:, :]
+
         # FC layer
-        logits = tf.matmul(output_layer, output_weights, transpose_b=True)
-        logits = tf.nn.bias_add(logits, output_bias)
+        logits = tf.layers.dense(output_layer, num_tags)
+
         # crf layer
         crf_params = tf.get_variable(name='crf', shape=[num_tags, num_tags],
                                      dtype=tf.float32)
         pred_id, _ = tf.contrib.crf.crf_decode(logits, crf_params,
-                                               sentence_len)
+                                               osentences_len)
         return logits, crf_params, pred_id, sentence_len
 
 
@@ -437,18 +424,24 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
         input_mask = features["input_mask"]
         segment_ids = features["segment_ids"]
         tag_ids = features["tag_ids"]
-        osentence_len = features["sentence_len"]
-        is_real_example = None
-        if "is_real_example" in features:
-            is_real_example = tf.cast(features["is_real_example"], dtype=tf.float32)
-        else:
-            is_real_example = tf.ones(tf.shape(tag_ids), dtype=tf.float32)
+        osentences_len = features["sentence_len"]
 
         is_training = (mode == tf.estimator.ModeKeys.TRAIN)
 
         (logits, crf_params, pred_ids, sentence_len) = create_model(
             bert_config, is_training, input_ids, input_mask, segment_ids,
-            num_tags)
+            num_tags, osentences_len)
+
+        if mode == tf.estimator.ModeKeys.PREDICT:
+            pred_tags = id_to_tag.lookup(tf.to_int64(pred_ids))
+            predictions = {
+                "pred_ids": pred_ids,
+                "pred_string": pred_tags
+            }
+            output_spec = tf.estimator.EstimatorSpec(
+                mode=mode,
+                predictions=predictions, )
+            return output_spec
 
         tvars = tf.trainable_variables()
         initialized_variable_names = {}
@@ -467,46 +460,40 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
                             init_string)
 
         # Calculate the loss prediction
-        log_likehood = tf.contrib.crf.crf_log_likelihood(logits, tag_ids,
-                                                         osentence_len,
+        log_likehood, _ = tf.contrib.crf.crf_log_likelihood(logits, tag_ids,
+                                                         osentences_len,
                                                          crf_params)
         loss = tf.reduce_mean(-log_likehood)
 
         # metric
-        weights = tf.sequence_mask(osentence_len, sentence_len - 1)
+        weights = tf.sequence_mask(osentences_len, sentence_len - 1)
         metrics = {
             'acc': tf.metrics.accuracy(tag_ids, pred_ids, weights),
             'loss': loss,
         }
 
         # write summary
-        for metric_name, op in metrics:
-            tf.summary.scalar(metric_name, op[1])
+        for metric_name, op in metrics.items():
+            if metric_name == 'loss':
+                tf.summary.scalar(metric_name, op)
+            else:
+                tf.summary.scalar(metric_name, op[1])
         output_spec = None
         if mode == tf.estimator.ModeKeys.TRAIN:
             train_op = optimization.create_optimizer(
                 loss, learning_rate, num_train_steps,
-                num_warmup_steps, False)
+                num_warmup_steps, use_tpu=False)
 
-            output_spec = tf.contrib.EstimatorSpec(
+            output_spec = tf.estimator.EstimatorSpec(
                 mode=mode,
-                loss=loss,
-                train_op=train_op)
+                train_op=train_op,
+                loss=loss)
         elif mode == tf.estimator.ModeKeys.EVAL:
 
-            output_spec = tf.contrib.EstimatorSpec(
+            output_spec = tf.estimator.EstimatorSpec(
                 mode=mode,
                 loss=loss,
-                eval_metrics=metrics,)
-        else:
-            pred_tags = id_to_tag.lookup(tf.to_int64(pred_ids))
-            predictions = {
-                "pred_ids": pred_ids,
-                "pred_string": pred_tags
-            }
-            output_spec = tf.contrib.tpu.TPUEstimatorSpec(
-                mode=mode,
-                predictions=predictions,)
+                eval_metric_ops=metrics)
         return output_spec
 
     return model_fn
@@ -517,7 +504,8 @@ def get_tag_map_tensors(params):
         tags = json.load(f_in)
     tag_to_id = {tags[i]: i for i in range(len(tags))}
     tag_to_id["PAD"] = 0
-    id_to_tag = {v: k for k, v in tag_to_id}
+
+    id_to_tag = {v: k for k, v in tag_to_id.items()}
     num_tags = len(tags)
     return tag_to_id, id_to_tag, num_tags
 
@@ -644,6 +632,7 @@ def main(_):
         learning_rate=FLAGS.learning_rate,
         num_train_steps=num_train_steps,
         num_warmup_steps=num_warmup_steps)
+    model_fn = functools.partial(model_fn, params=FLAGS)
 
     # Original config
     config = tf.estimator.RunConfig(save_checkpoints_steps=1000)
@@ -666,6 +655,7 @@ def main(_):
             seq_length=FLAGS.max_seq_length,
             is_training=True,
             drop_remainder=True)
+        train_input_fn = functools.partial(train_input_fn, params=FLAGS)
         estimator.train(input_fn=train_input_fn, max_steps=num_train_steps)
 
     if FLAGS.do_eval:
@@ -690,6 +680,7 @@ def main(_):
             seq_length=FLAGS.max_seq_length,
             is_training=False,
             drop_remainder=False)
+        eval_input_fn = functools.partial(eval_input_fn, params=FLAGS)
 
         result = estimator.evaluate(input_fn=eval_input_fn, steps=eval_steps)
 
@@ -721,6 +712,7 @@ def main(_):
             is_training=False,
             drop_remainder=False)
 
+        predict_input_fn = functools.partial(predict_input_fn, params=FLAGS)
         result = estimator.predict(input_fn=predict_input_fn)
 
         output_predict_file = os.path.join(FLAGS.output_dir, "test_results.tsv")
