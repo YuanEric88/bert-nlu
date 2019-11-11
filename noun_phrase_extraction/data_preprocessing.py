@@ -26,9 +26,14 @@ def preprocessing(input_name, output_name):
                     except:
                         print(pair)
                         pass
-                sentence = " ".join(sentence)
-                tags = " ".join(tags)
-                f_out.write(sentence + "\t" + tags + "\n")
+                # Tensorflow version
+                # sentence = " ".join(sentence)
+                # tags = " ".join(tags)
+                # f_out.write(sentence + "\t" + tags + "\n")
+                # hugging face version
+                for token, tag in zip(sentence, tags):
+                    f_out.write(token + " " + tag + "\n")
+                f_out.write("\n")
 
 
 if __name__ == "__main__":
